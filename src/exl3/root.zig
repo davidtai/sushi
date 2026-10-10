@@ -128,6 +128,19 @@ fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.m
     return out;
 }
 
+/// The prefill GEMM over routed slots known on the host: `x` [rows, D] and `slots` rows x K (row-major) with their
+/// `scores` [rows * K]; the sort and the window table built on the host (`kernels.moePrefillHostSlots`: the call never
+/// waits for the GPU). Returns [rows, D] in x's dtype.
+pub fn moePrefillHost(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, slots: []const u32, scores: mlx.mlx_array, dec: format.Decode) !mlx.mlx_array {
+    kernels.setDecodeParams(dec);
+    const rows: usize = @intCast(mlx.getShape(x)[0]);
+    if (rows == 0 or slots.len % rows != 0) return error.BadExl3Shape;
+    const g = bank.gate;
+    const u = bank.up;
+    const d = bank.down;
+    return kernels.moePrefillHostSlots(s, x, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots, scores, @intCast(slots.len / rows));
+}
+
 pub const Spec = struct {
     rate: format.Rate,
     codebook: format.Codebook,

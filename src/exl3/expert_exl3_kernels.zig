@@ -1429,6 +1429,8 @@ fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c
     var contig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(contig);
     try mlx.check(mlx.mlx_contiguous(&contig, eids, false, s));
+    // The table needs the GPU-sorted ids on the host: the one wait on the GPU (`prefill_drains`).
+    prefill_drains += 1;
     try mlx.check(mlx.mlx_array_eval(contig));
     switch (mlx.mlx_array_dtype(contig)) {
         .uint32 => {
@@ -1441,48 +1443,11 @@ fn buildWindowTableHost(s: mlx.mlx_stream, eids: mlx.mlx_array, n: c_int, win: c
         },
         else => return error.BadExl3Shape,
     }
-    const runs = try buildRuns(std.heap.page_allocator, ids);
-    defer std.heap.page_allocator.free(runs.start);
-    defer std.heap.page_allocator.free(runs.len);
-    defer std.heap.page_allocator.free(runs.eid);
-    const w: u32 = @intCast(win);
-    var nwin_u: u32 = 0;
-    var r: u32 = 0;
-    while (r < runs.n) : (r += 1) {
-        nwin_u += (runs.len[r] + w - 1) / w;
-    }
-    const sh = try std.heap.page_allocator.alloc(u32, nwin_u);
-    defer std.heap.page_allocator.free(sh);
-    const lh = try std.heap.page_allocator.alloc(u32, nwin_u);
-    defer std.heap.page_allocator.free(lh);
-    var k: u32 = 0;
-    r = 0;
-    while (r < runs.n) : (r += 1) {
-        var off: u32 = 0;
-        while (off < runs.len[r]) {
-            const live = @min(w, runs.len[r] - off);
-            sh[k] = runs.start[r] + off;
-            lh[k] = live;
-            k += 1;
-            off += live;
-        }
-    }
-    const starts_raw = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(starts_raw);
-    const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(nlives_raw);
-    var starts = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(starts);
-    var nlives = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(nlives);
-    try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
-    try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(starts));
-    try mlx.check(mlx.mlx_array_eval(nlives));
+    const tab = try windowTableOfHostIds(ids, win);
     if (exl3UbenchOn()) {
-        benchPrint("[exl3-ubench] win_table_host nwin={d} n={d} win={d} eval=eids\n", .{ nwin_u, n, win });
+        benchPrint("[exl3-ubench] win_table_host nwin={d} n={d} win={d} eval=eids\n", .{ tab.nwin, n, win });
     }
-    return .{ .starts = starts, .nlives = nlives, .nwin = @intCast(nwin_u) };
+    return tab;
 }
 
 fn buildStrideTable(s: mlx.mlx_stream, n: c_int, win: c_int) !WindowTable {
@@ -1499,22 +1464,124 @@ fn buildStrideTable(s: mlx.mlx_stream, n: c_int, win: c_int) !WindowTable {
         sh[i] = st;
         lh[i] = @min(w, nn - st);
     }
-    const starts_raw = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(starts_raw);
-    const nlives_raw = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(nlives_raw);
-    var starts = mlx.mlx_array_new();
+    // Host data: the arrays copy it at creation, nothing waits for the GPU.
+    _ = s;
+    const starts = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     errdefer _ = mlx.mlx_array_free(starts);
-    var nlives = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(nlives);
-    try mlx.check(mlx.mlx_contiguous(&starts, starts_raw, false, s));
-    try mlx.check(mlx.mlx_contiguous(&nlives, nlives_raw, false, s));
-    try mlx.check(mlx.mlx_array_eval(starts));
-    try mlx.check(mlx.mlx_array_eval(nlives));
+    const nlives = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
     if (exl3UbenchOn()) {
         benchPrint("[exl3-ubench] win_table_stride nwin={d} n={d} win={d}\n", .{ nwin_u, n, win });
     }
     return .{ .starts = starts, .nlives = nlives, .nwin = @intCast(nwin_u) };
+}
+
+/// The prefill path's waits on the GPU (the GPU-sorted ids read back for the window table): a count the caller reads
+/// (`moePrefillHostSlots` never adds to it).
+pub var prefill_drains: u64 = 0;
+
+/// The aligned window table of host-sorted slot ids, built on the host into new arrays: nothing is evaluated, so the
+/// caller never waits for the GPU.
+fn windowTableOfHostIds(ids: []const u32, win: c_int) !WindowTable {
+    const runs = try buildRuns(std.heap.page_allocator, ids);
+    defer std.heap.page_allocator.free(runs.start);
+    defer std.heap.page_allocator.free(runs.len);
+    defer std.heap.page_allocator.free(runs.eid);
+    const w: u32 = @intCast(win);
+    var nwin_u: u32 = 0;
+    var r: u32 = 0;
+    while (r < runs.n) : (r += 1) nwin_u += (runs.len[r] + w - 1) / w;
+    const sh = try std.heap.page_allocator.alloc(u32, nwin_u);
+    defer std.heap.page_allocator.free(sh);
+    const lh = try std.heap.page_allocator.alloc(u32, nwin_u);
+    defer std.heap.page_allocator.free(lh);
+    var k: u32 = 0;
+    r = 0;
+    while (r < runs.n) : (r += 1) {
+        var off: u32 = 0;
+        while (off < runs.len[r]) {
+            const live = @min(w, runs.len[r] - off);
+            sh[k] = runs.start[r] + off;
+            lh[k] = live;
+            k += 1;
+            off += live;
+        }
+    }
+    const starts = mlx.mlx_array_new_data(sh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    errdefer _ = mlx.mlx_array_free(starts);
+    const nlives = mlx.mlx_array_new_data(lh.ptr, &[_]c_int{@intCast(nwin_u)}, 1, .uint32);
+    return .{ .starts = starts, .nlives = nlives, .nwin = @intCast(nwin_u) };
+}
+
+/// `moePrefill` whose routed slots are host values (`slots`: rows x topk, row-major): the slots sorted, their order and
+/// the GEMM's window table built on the host, so the call never waits for the GPU. The same kernels over the same rows
+/// (only the order among equal slots may differ, and each row's output does not depend on it): the outputs equal
+/// moePrefill's. MiMo's shapes keep moePrefill's own table.
+pub fn moePrefillHostSlots(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: []const u32,
+    scores: mlx.mlx_array,
+    topk: c_int,
+) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const rows = xsh[0];
+    const hidden = xsh[1];
+    const nslots = rows * topk;
+    if (slots.len != @as(usize, @intCast(nslots))) return error.BadExl3Shape;
+    const n: c_int = @intCast(slots.len);
+    const slots_a = mlx.mlx_array_new_data(slots.ptr, &[_]c_int{n}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots_a);
+    const gt = mlx.getShape(gate_t);
+    if (mimoPrefillOn(hidden, gt[2] * 16, gt[0], topk)) return moePrefill(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots_a, scores, topk);
+    const a = std.heap.page_allocator;
+    const order = try a.alloc(u32, slots.len);
+    defer a.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.sort.block(u32, order, slots, struct {
+        fn lt(sl: []const u32, p: u32, q: u32) bool {
+            return sl[p] < sl[q];
+        }
+    }.lt);
+    const sorted = try a.alloc(u32, slots.len);
+    defer a.free(sorted);
+    const order_i = try a.alloc(i32, slots.len);
+    defer a.free(order_i);
+    for (order, sorted, order_i) |o, *d, *oi| {
+        d.* = slots[o];
+        oi.* = @intCast(o);
+    }
+    const sorted_a = mlx.mlx_array_new_data(sorted.ptr, &[_]c_int{n}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(sorted_a);
+    const order_a = mlx.mlx_array_new_data(order_i.ptr, &[_]c_int{n}, 1, .int32);
+    defer _ = mlx.mlx_array_free(order_a);
+    const prep = try pairPrepareFromTokens(s, x, gate_suh, up_suh, sorted_a, order_a, hidden, nslots, topk);
+    defer _ = mlx.mlx_array_free(prep[0]);
+    defer _ = mlx.mlx_array_free(prep[1]);
+    const win = gemmWindowRows();
+    const aligned = gemmWindowAligned();
+    const tab = if (aligned) try windowTableOfHostIds(sorted, win) else try buildStrideTable(s, nslots, win);
+    defer _ = mlx.mlx_array_free(tab.starts);
+    defer _ = mlx.mlx_array_free(tab.nlives);
+    const g_inner = try innerGemmSortedTable(s, prep[0], gate_t, sorted_a, win, aligned, tab);
+    defer _ = mlx.mlx_array_free(g_inner);
+    const u_inner = try innerGemmSortedTable(s, prep[1], up_t, sorted_a, win, aligned, tab);
+    defer _ = mlx.mlx_array_free(u_inner);
+    const down_x = try midSwigluPrep(s, g_inner, u_inner, gate_svh, up_svh, down_suh, sorted_a, mlx.getShape(g_inner)[1], nslots);
+    defer _ = mlx.mlx_array_free(down_x);
+    const d_inner = try innerGemmSortedTable(s, down_x, down_t, sorted_a, win, aligned, tab);
+    defer _ = mlx.mlx_array_free(d_inner);
+    const d_unsorted = try scatterSorted(s, d_inner, order_a, hidden, nslots);
+    defer _ = mlx.mlx_array_free(d_unsorted);
+    return downFinishReduce(s, d_unsorted, down_svh, slots_a, scores, hidden, rows, topk, mlx.mlx_array_dtype(x));
 }
 
 fn windowStats(ids: []const u32, win: u32, aligned: bool) struct { nwin: u32, mixed: u32, decodes: u32 } {
@@ -3674,6 +3741,96 @@ test "exl3 row count is the leading dims, not the activation width" {
     try t.expect(!usesPrefillArm(rowsOfShape(&[_]c_int{ 16, 1, 2560 })));
     try t.expect(usesPrefillArm(rowsOfShape(&[_]c_int{ 17, 1, 2560 })));
     try t.expect(!usesPrefillArm(rowsOfShape(&[_]c_int{ 4, 2560 })));
+}
+
+test "exl3 prefill over host slots equals moePrefill bit for bit and never waits for the GPU" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // A small bank in GLM-5.3's layout (minis of 256 over hidden 256, K4) and a prompt's routed slots.
+    const E: c_int = 12;
+    const H: c_int = 256;
+    const I: c_int = 256;
+    const R: c_int = 40;
+    const topk: c_int = 4;
+    var prng = std.Random.DefaultPrng.init(53);
+    const rnd = prng.random();
+    const words = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, n: usize) ![]u16 {
+            const w = try a.alloc(u16, n);
+            for (w) |*v| v.* = @truncate(r.int(u32));
+            return w;
+        }
+        fn signs(a: std.mem.Allocator, r: std.Random, n: usize) ![]u16 {
+            const w = try a.alloc(u16, n);
+            for (w) |*v| v.* = exl3.f32ToF16Bits(if (r.boolean()) 0.25 else -0.25);
+            return w;
+        }
+    };
+    const proj = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, e: c_int, in: c_int, out: c_int) ![3]mlx.mlx_array {
+            const tr = try words.f(a, r, @intCast(e * @divExact(in, 16) * @divExact(out, 16) * 64));
+            const su = try words.signs(a, r, @intCast(e * in));
+            const sv = try words.signs(a, r, @intCast(e * out));
+            return .{
+                mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ e, @divExact(in, 16), @divExact(out, 16), 64 }, 4, .uint16),
+                mlx.mlx_array_new_data(su.ptr, &[_]c_int{ e, in }, 2, .float16),
+                mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ e, out }, 2, .float16),
+            };
+        }
+    };
+    const g = try proj.f(alloc, rnd, E, H, I);
+    const u = try proj.f(alloc, rnd, E, H, I);
+    const d = try proj.f(alloc, rnd, E, I, H);
+    defer for ([_][3]mlx.mlx_array{ g, u, d }) |p3| for (p3) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const xh = try alloc.alloc(u16, @intCast(R * H));
+    for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.5 - 0.25);
+    const slots_h = try alloc.alloc(u32, @intCast(R * topk));
+    for (slots_h) |*v| v.* = rnd.uintLessThan(u32, @intCast(E));
+    const scores_h = try alloc.alloc(f32, @intCast(R * topk));
+    for (scores_h) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+    const xf = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ R, H }, 2, .float16);
+    defer _ = mlx.mlx_array_free(xf);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{R * topk}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{R * topk}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    // The codebook is process-global: the tests after this one read the one they set.
+    const was = active_decode;
+    defer active_decode = was;
+    setDecodeParams(.mcg);
+    const drains0 = prefill_drains;
+    const want = try moePrefill(s, x, g[0], g[1], g[2], u[0], u[1], u[2], d[0], d[1], d[2], slots, scores, topk);
+    defer _ = mlx.mlx_array_free(want);
+    // moePrefill read its GPU-sorted slots back once; the host-slots path never waits.
+    try t.expectEqual(drains0 + 1, prefill_drains);
+    const got = try moePrefillHostSlots(s, x, g[0], g[1], g[2], u[0], u[1], u[2], d[0], d[1], d[2], slots_h, scores, topk);
+    defer _ = mlx.mlx_array_free(got);
+    try t.expectEqual(drains0 + 1, prefill_drains);
+    var wf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wf);
+    var gf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gf);
+    try mlx.check(mlx.mlx_astype(&wf, want, .float32, s));
+    try mlx.check(mlx.mlx_astype(&gf, got, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(wf));
+    try mlx.check(mlx.mlx_array_eval(gf));
+    const n: usize = @intCast(R * H);
+    const wv = mlx.mlx_array_data_float32(wf).?[0..n];
+    const gv = mlx.mlx_array_data_float32(gf).?[0..n];
+    var scale: f32 = 0;
+    for (wv) |v| scale = @max(scale, @abs(v));
+    try t.expect(scale > 0);
+    try t.expectEqualSlices(u8, std.mem.sliceAsBytes(wv), std.mem.sliceAsBytes(gv));
+    try t.expectError(error.BadExl3Shape, moePrefillHostSlots(s, x, g[0], g[1], g[2], u[0], u[1], u[2], d[0], d[1], d[2], slots_h[1..], scores, topk));
 }
 
 test "exl3 prefill arm is used only above 16 rows" {
