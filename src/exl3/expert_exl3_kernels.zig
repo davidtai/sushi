@@ -64,6 +64,17 @@ const DECODE_GROUP_MAX_SLOTS: c_int = 64;
 /// Routes a multi-row block through the single-slot kernels: the grouped kernels' byte reference.
 var grouped_off_for_test: bool = false;
 
+/// The grouped kernels' byte reference for a caller's test (`grouped_off_for_test`), and whether a grouped kernel ran
+/// since the last reset.
+pub fn setGroupedOffForTest(off: bool) void {
+    grouped_off_for_test = off;
+    grouped_engaged = false;
+}
+
+pub fn groupedEngagedForTest() bool {
+    return grouped_engaged;
+}
+
 fn addGroup(cfg: mlx.mlx_fast_metal_kernel_config, group: c_int, nslots: c_int) !void {
     if (group == 0) return;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GROUP", group));
@@ -1191,7 +1202,7 @@ var gemm_nax_failed: bool = false;
 var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
 const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, topk: c_int, n: u32, layout: GemvLayout, group: c_int };
-const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, n: u32, layout: GemvLayout, group: c_int = 0 };
+const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, n: u32, layout: GemvLayout, group: c_int = 0, topk: c_int = 0 };
 const MidKey = struct { dim: c_int, nslots: c_int, limit: c_int = 0 };
 const ReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int };
 const DecodeReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int, dtype: mlx.mlx_dtype };
@@ -2624,6 +2635,9 @@ fn logFunnel(on: bool, n: u32, arm: FunnelArm, dtype: mlx.mlx_dtype) void {
 
 var pair_gemv_kernel: KernelSlots = no_kernels;
 var pair_gemv_grouped_kernel: KernelSlots = no_kernels;
+var pair_gemv_minis_kernel: KernelSlots = no_kernels;
+var down_fused_minis_kernel: KernelSlots = no_kernels;
+var down_minis_cfgs: CfgCache(DownFusedKey, 8) = .{};
 var mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_shared_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -2708,6 +2722,85 @@ pub fn pairGemv(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: 
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     try mlx.check(mlx.mlx_vector_array_get(&b, ov, 1));
     return .{ a, b };
+}
+
+/// `pairGemv` on GLM-5.3's minis (`glmMinisOn`): each mini decoded once for up to `DECODE_GROUP_MEMBERS` of the pairs
+/// that route it (`PAIR_GEMV_MINIS_SOURCE`), every slot's planes the single-slot kernel's bytes.
+pub fn pairGemvMinis(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array, in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
+    const tsh = mlx.getShape(tg);
+    const ush = mlx.getShape(tu);
+    const rate = try packedRate(tsh[tsh.len - 1]);
+    if (ush[ush.len - 1] != tsh[tsh.len - 1]) return error.BadExl3Shape;
+    const layout = gemvLayout(rate.n, @divExact(out_dim, 16));
+    if (!layout.funnel and rate.n != 64) return error.Exl3MinisRate;
+    const cfg = try pairGemvConfig(in_dim, out_dim, nslots, topk, rate, layout, DECODE_GROUP_MEMBERS);
+    const ins = [_][*:0]const u8{ "x", "suhg", "suhu", "tg", "tu", "slots" };
+    const outs = [_][*:0]const u8{ "yg", "yu" };
+    const kernel = try codebookKernel(&pair_gemv_minis_kernel, "sushi_exl3_pair_gemv_minis", &ins, &outs, PAIR_GEMV_MINIS_SOURCE);
+    logGroupedEngaged(DECODE_GROUP_MEMBERS);
+    const ov = try applyOuts(s, kernel, &.{ x, suhg, suhu, tg, tu, slots }, cfg, 2);
+    logFunnel(layout.funnel, rate.n, .pair, mlx.mlx_array_dtype(x));
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
+    var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&b, ov, 1));
+    return .{ a, b };
+}
+
+/// `downGemvFusedMid` on GLM-5.3's minis (`glmMinisOn`): each member's middle made in the leader's threadgroup, each
+/// mini decoded once for up to `DECODE_GROUP_MEMBERS` pairs (`DOWN_FUSED_MINIS_SOURCE`), every slot's output the
+/// single-slot kernel's bytes.
+pub fn downGemvFusedMidMinis(
+    s: mlx.mlx_stream,
+    ig: mlx.mlx_array,
+    iu: mlx.mlx_array,
+    trellis: mlx.mlx_array,
+    svhg: mlx.mlx_array,
+    svhu: mlx.mlx_array,
+    suhd: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    in_dim: c_int,
+    out_dim: c_int,
+    nslots: c_int,
+    topk: c_int,
+) !mlx.mlx_array {
+    const tsh = mlx.getShape(trellis);
+    const rate = try packedRate(tsh[tsh.len - 1]);
+    const out_tiles = @divExact(out_dim, 16);
+    const nsplit: c_int = @intCast(pairSplitCountFor(out_dim));
+    const layout = gemvLayout(rate.n, out_tiles);
+    if (!layout.funnel and rate.n != 64) return error.Exl3MinisRate;
+    const key = DownFusedKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit, .n = rate.n, .layout = layout, .group = DECODE_GROUP_MEMBERS, .topk = topk };
+    const cfg = down_minis_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const sh = [_]c_int{ nslots, out_dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(out_tiles, layout.tiles) * 128, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NSPLIT", nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
+        try addGemvLayout(c, layout);
+        try addGroup(c, DECODE_GROUP_MEMBERS, nslots);
+        down_minis_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ins = [_][*:0]const u8{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" };
+    const outs = [_][*:0]const u8{"y"};
+    const kernel = try codebookKernel(&down_fused_minis_kernel, "sushi_exl3_down_fused_minis", &ins, &outs, DOWN_FUSED_MINIS_SOURCE);
+    const ov = try applyOuts(s, kernel, &.{ ig, iu, trellis, svhg, svhu, suhd, slots }, cfg, 1);
+    logFunnel(layout.funnel, rate.n, .fused_mid_down, mlx.mlx_array_dtype(ig));
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
+    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
+    return a;
 }
 
 fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, dim: c_int, nslots: c_int) !mlx.mlx_array {
@@ -2946,11 +3039,16 @@ pub fn moeSwigluFusedWithShared(
     // Only MiMo's verify rows share enough experts for grouping to pay.
     const group: c_int = if (prepared and rows >= 2 and nslots <= DECODE_GROUP_MAX_SLOTS and !grouped_off_for_test) DECODE_GROUP_MEMBERS else 0;
     // A one-row pair keeps preparing its own K span: the extra prepare dispatch costs it more than it saves.
+    // GLM-5.3's pairs: each mini decoded once for the pairs that route it.
+    const minis = !prepared and glmMinisOn(hidden, inter, topk, rows) and !grouped_off_for_test;
     const inners = if (prepared and rows >= 2) blk: {
         const prep = try pairPrepare(s, x, gate_suh, up_suh, slots, hidden, nslots, topk);
         defer _ = mlx.mlx_array_free(prep);
         break :blk try pairGemvPrepared(s, prep, gate_t, up_t, slots, hidden, inter, nslots, topk, group);
-    } else try pairGemv(s, x, gate_suh, up_suh, gate_t, up_t, slots, hidden, inter, nslots, topk, group);
+    } else if (minis)
+        try pairGemvMinis(s, x, gate_suh, up_suh, gate_t, up_t, slots, hidden, inter, nslots, topk)
+    else
+        try pairGemv(s, x, gate_suh, up_suh, gate_t, up_t, slots, hidden, inter, nslots, topk, group);
     defer _ = mlx.mlx_array_free(inners[0]);
     defer _ = mlx.mlx_array_free(inners[1]);
     try ubenchEval(inners[0], "pair_gemv");
@@ -2967,7 +3065,10 @@ pub fn moeSwigluFusedWithShared(
             log.info("[exl3-decode] prepared mid engaged dtype=bfloat16 middle=f16 after down-input Hadamard\n", .{});
         }
         break :blk y;
-    } else try downGemvFusedMid(s, inners[0], inners[1], down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots);
+    } else if (minis)
+        try downGemvFusedMidMinis(s, inners[0], inners[1], down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots, topk)
+    else
+        try downGemvFusedMid(s, inners[0], inners[1], down_t, gate_svh, up_svh, down_suh, slots, inter, hidden, nslots);
     defer _ = mlx.mlx_array_free(down_inner);
     try ubenchEval(down_inner, "down_gemv");
     // The SwiGLU product and the down inner plane are the f16 stores that can
@@ -8273,6 +8374,25 @@ fn groupBySize(comptime body: fn (comptime []const u8) []const u8) []const u8 {
 }
 
 fn pairGroupedBody(comptime mc: []const u8) []const u8 {
+    return pairGroupedBodyOf(mc, pairFunnelChunk(mc));
+}
+
+/// One staged chunk's k loop of the lane-funnel arm: two k-tiles an iteration.
+fn pairFunnelChunk(comptime mc: []const u8) []const u8 {
+    return
+    \\    const threadgroup half *pp = prepared + sg * TILE;
+    \\    for (uint tk = c0 + sg; tk < c1; tk += 2u * SGS) {
+    \\
+    ++ groupFunnelStep(mc, "(pp + j * CHUNK)") ++
+        \\      pp += 2u * SGS * TILE;
+        \\    }
+        \\
+    ;
+}
+
+/// The grouped pair GEMV over `mc` members: each projection's k span staged one chunk of the members' prepared inputs at
+/// a time, `kloop` the chunk's k loop.
+fn pairGroupedBodyOf(comptime mc: []const u8, comptime kloop: []const u8) []const u8 {
     return
     \\for (uint proj = 0u; proj < 2u; proj++) {
     \\  const device half *suh = (proj == 0u) ? suhg : suhu;
@@ -8321,12 +8441,8 @@ fn pairGroupedBody(comptime mc: []const u8) []const u8 {
         \\    }
         \\    }
         \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    const threadgroup half *pp = prepared + sg * TILE;
-        \\    for (uint tk = c0 + sg; tk < c1; tk += 2u * SGS) {
         \\
-    ++ groupFunnelStep(mc, "(pp + j * CHUNK)") ++
-        \\      pp += 2u * SGS * TILE;
-        \\    }
+    ++ kloop ++
         \\  }
         \\
     ++ groupEpilogue(mc, "y[(size_t)(members[j] * uint(NSPLIT) + split) * (size_t)(ODIM) + (ot + o) * TILE + (lid & 15u)]", "") ++
@@ -8337,7 +8453,10 @@ fn pairGroupedBody(comptime mc: []const u8) []const u8 {
 
 /// `PAIR_GEMV_SOURCE`'s lane-funnel arm, grouped. Members' prepared inputs are staged one
 /// projection and one k chunk at a time, so threadgroup memory stays the single-slot 8 KiB.
-const PAIR_GEMV_GROUPED_SOURCE: [:0]const u8 =
+const PAIR_GEMV_GROUPED_SOURCE: [:0]const u8 = PAIR_GEMV_GROUPED_HEAD ++ GROUP_MEMBERS_SOURCE ++ groupBySize(pairGroupedBody);
+
+/// The grouped pair GEMVs' constants, staging buffers and threadgroup coordinates.
+const PAIR_GEMV_GROUPED_HEAD =
     \\constexpr uint TILE = 16u;
     \\constexpr uint N = uint(NHW);
     \\constexpr uint PACKED_W = N / 2u;
@@ -8360,7 +8479,7 @@ const PAIR_GEMV_GROUPED_SOURCE: [:0]const u8 =
     \\const uint tk1 = min(tk0 + tiles_per_split, IT);
     \\const float psc = 0.08838834764831845f;
     \\
-++ GROUP_MEMBERS_SOURCE ++ groupBySize(pairGroupedBody);
+;
 
 fn downGroupedBody(comptime mc: []const u8) []const u8 {
     return "float acc[" ++ mc ++ "][OTPT][8] = {};\n" ++
@@ -8391,6 +8510,123 @@ const DOWN_PREPARED_GROUPED_SOURCE: [:0]const u8 =
     \\const uint lid = uint(thread_index_in_threadgroup);
     \\
 ++ GROUP_MEMBERS_SOURCE ++ groupBySize(downGroupedBody);
+
+/// GLM-5.3's minis (`glmMinisOn`): a pair's TOPK slots are its expert's minis (expert row x TOPK + rank) at positions
+/// pair x TOPK + rank, so a slot's equals sit at its own rank of the other pairs, and NSLOTS / TOPK pairs fit one 64-bit
+/// ballot. The slot whose index among its rank's equals is a multiple of `GROUP` leads itself and the next
+/// `GROUP - 1` (the other threadgroups return); a SKIP_SLOT slot (0xFFFFFFFF) leads nothing and matches no mini.
+const GROUP_MINIS_SOURCE =
+    \\const uint eid = uint(slots[first]);
+    \\if (eid == 0xFFFFFFFFu) return;
+    \\const uint rank = first % uint(TOPK);
+    \\const uint fp = first / uint(TOPK);
+    \\constexpr uint NPAIRS = uint(NSLOTS) / uint(TOPK);
+    \\ulong same = 0ul;
+    \\for (uint b = 0u; b < NPAIRS; b += 32u) {
+    \\  const bool hit = b + lane < NPAIRS && uint(slots[(b + lane) * uint(TOPK) + rank]) == eid;
+    \\  same |= (ulong)static_cast<simd_vote::vote_t>(simd_ballot(hit)) << b;
+    \\}
+    \\if (popcount(same & ((1ul << fp) - 1ul)) % uint(GROUP) != 0u) return;
+    \\ulong rest = same >> fp;
+    \\uint members[GROUP];
+    \\uint m = 0u;
+    \\for (uint j = 0u; j < uint(GROUP); j++) {
+    \\  members[j] = (fp + (rest != 0ul ? uint(ctz(rest)) : 0u)) * uint(TOPK) + rank;
+    \\  m += rest != 0ul ? 1u : 0u;
+    \\  rest &= rest - 1ul;
+    \\}
+    \\const uint prow = (lane & 3u) * 2u;
+    \\const uint pcol = lane >> 2u;
+    \\const uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
+    \\
+;
+
+/// One k-tile `tk` of the single-slot kernels' packed arm (N = 64: one output tile, the lane's two words) over `mc`
+/// members; `member_ptr` points at member j's inputs for that k-tile.
+fn groupPackedStep(comptime mc: []const u8, comptime member_ptr: []const u8) []const u8 {
+    return
+    \\const device uint *words = trellis_e + ((size_t)tk * (size_t)OT + ot) * 32u;
+    \\const ulong merged = ((ulong)words[(lane + 31u) & 31u] << 32) | (ulong)words[lane];
+    \\
+    ++ "float ins[" ++ mc ++ "][4];\nfor (uint j = 0u; j < " ++ mc ++ "; j++) {\n  const auto q = " ++ member_ptr ++ ";\n" ++
+        \\  ins[j][0] = float(q[prow]);
+        \\  ins[j][1] = float(q[prow + 1u]);
+        \\  ins[j][2] = float(q[prow + 8u]);
+        \\  ins[j][3] = float(q[prow + 9u]);
+        \\}
+        \\const uint shk[8] = {28u, 24u, 20u, 16u, 12u, 8u, 4u, 0u};
+        \\for (uint p = 0u; p < 4u; p++) {
+        \\  const uint2 cw = uint2(uint(merged >> shk[p * 2u]), uint(merged >> shk[p * 2u + 1u])) & uint2(0xffffu);
+        \\  const float2 w = exl3_decode2(cw);
+        \\
+    ++ "  for (uint j = 0u; j < " ++ mc ++ "; j++) {\n" ++
+        \\    acc[j][0][p * 2u] = fma(ins[j][(p * 2u) & 3u], w.x, acc[j][0][p * 2u]);
+        \\    acc[j][0][p * 2u + 1u] = fma(ins[j][(p * 2u + 1u) & 3u], w.y, acc[j][0][p * 2u + 1u]);
+        \\  }
+        \\}
+        \\
+    ;
+}
+
+/// The minis' grouped pair GEMV: the packed arm for K4 (N = 64), the lane funnel for the other rates.
+fn pairMinisBody(comptime mc: []const u8) []const u8 {
+    return pairGroupedBodyOf(mc, "    if (N == 64u) {\n    for (uint tk = c0 + sg; tk < c1; tk += SGS) {\n" ++
+        groupPackedStep(mc, "(prepared + j * CHUNK + (tk - c0) * TILE)") ++ "    }\n    } else {\n" ++ pairFunnelChunk(mc) ++ "    }\n");
+}
+
+/// `PAIR_GEMV_SOURCE` over GLM-5.3's minis, grouped (`GROUP_MINIS_SOURCE`): each mini decoded once for its members,
+/// every member's accumulators in the single-slot kernel's order.
+const PAIR_GEMV_MINIS_SOURCE: [:0]const u8 = PAIR_GEMV_GROUPED_HEAD ++ GROUP_MINIS_SOURCE ++ groupBySize(pairMinisBody);
+
+/// The fused-mid down's k loop and store over `mc` members, their middles in threadgroup memory.
+fn downMinisBody(comptime mc: []const u8) []const u8 {
+    return "float acc[" ++ mc ++ "][OTPT][8] = {};\n" ++
+        \\const device uint *trellis_e = (const device uint *)(trellis + ((size_t)eid * (size_t)IT * (size_t)OT) * N);
+        \\if (N == 64u) {
+        \\for (uint tk = sg; tk < IT; tk += SGS) {
+        \\
+    ++ groupPackedStep(mc, "(prepared + j * uint(IDIM) + tk * TILE)") ++
+        \\}
+        \\} else {
+        \\const device uint *wp = trellis_e + ((size_t)sg * (size_t)OT + ot) * PACKED_W;
+        \\const threadgroup half *pp = prepared + sg * TILE;
+        \\for (uint tk = sg; tk < IT; tk += 2u * SGS) {
+        \\
+    ++ groupFunnelStep(mc, "(pp + j * uint(IDIM))") ++
+        \\  pp += 2u * SGS * TILE;
+        \\}
+        \\}
+        \\
+    ++ groupEpilogue(mc, "y[(size_t)members[j] * (size_t)(ODIM) + (ot + o) * TILE + (lid & 15u)]", "half");
+}
+
+/// `DOWN_FUSED_SOURCE` over GLM-5.3's minis, grouped: each member's middle (the single-slot kernel's own text, at its
+/// slot) into threadgroup memory, then each mini decoded once for its members.
+const DOWN_FUSED_MINIS_SOURCE: [:0]const u8 = blk: {
+    @setEvalBranchQuota(400000);
+    const start = std.mem.indexOf(u8, DOWN_FUSED_SOURCE, "const uint nblocks").?;
+    const end = start + std.mem.indexOf(u8, DOWN_FUSED_SOURCE[start..], "threadgroup_barrier(mem_flags::mem_threadgroup);").?;
+    const mid = metalReplaceFound(metalReplaceFound(DOWN_FUSED_SOURCE[start..end], "(size_t)slot * uint(NSPLIT)", "(size_t)members[j] * uint(NSPLIT)"), "prepared[base", "prepared[j * uint(IDIM) + base");
+    const head =
+        \\threadgroup float partial[4 * 16 * uint(OTPT) * uint(GROUP)];
+        \\threadgroup half prepared[uint(GROUP) * uint(IDIM)];
+        \\const uint ot = uint(threadgroup_position_in_grid.x) * uint(OTPT);
+        \\const uint first = uint(threadgroup_position_in_grid.y);
+        \\const uint sg = uint(simdgroup_index_in_threadgroup);
+        \\const uint lane = uint(thread_index_in_simdgroup);
+        \\const uint lid = uint(thread_index_in_threadgroup);
+        \\constexpr uint TILE = 16u;
+        \\constexpr uint N = uint(NHW);
+        \\constexpr uint PACKED_W = N / 2u;
+        \\constexpr uint IT = uint(IDIM) / TILE;
+        \\constexpr uint OT = uint(ODIM) / TILE;
+        \\constexpr uint SGS = 4u;
+        \\const float sc = 0.08838834764831845f;
+        \\
+    ;
+    break :blk head ++ GROUP_MINIS_SOURCE ++ "for (uint j = 0u; j < uint(GROUP); j++) {\nif (j >= m) break;\n" ++ mid ++
+        "}\nthreadgroup_barrier(mem_flags::mem_threadgroup);\n" ++ groupBySize(downMinisBody);
+};
 
 /// Where lane `lane`'s value of a 128-block lands in lane order: each 16-row tile keeps rows
 /// (2q, 2q+1, 2q+8, 2q+9) at 4q..4q+3, the four a GEMV lane with `lane & 3 == q` reads.
@@ -8639,6 +8875,12 @@ fn downGemvPreparedMid(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, 
     errdefer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_vector_array_get(&y, outputs, 0));
     return y;
+}
+
+/// GLM-5.3's routed experts as its binding calls the decode chain: each pair a row of its expert's four 512-wide minis
+/// over hidden 6144 (`pairGemvMinis`, `downGemvFusedMidMinis`), two to 64 pairs (one ballot of a rank's pairs).
+fn glmMinisOn(hidden: c_int, inter: c_int, topk: c_int, rows: c_int) bool {
+    return hidden == 6144 and inter == 512 and topk == 4 and rows >= 2 and rows <= DECODE_GROUP_MAX_SLOTS;
 }
 
 fn preparedMidOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int, rows: c_int, dtype: mlx.mlx_dtype) bool {
