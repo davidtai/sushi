@@ -77,8 +77,15 @@ pub fn groupedEngagedForTest() bool {
 
 fn addGroup(cfg: mlx.mlx_fast_metal_kernel_config, group: c_int, nslots: c_int) !void {
     if (group == 0) return;
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GROUP", group));
+    try addGroupMembers(cfg, group);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSLOTS", nslots));
+}
+
+/// GROUP alone: a template argument per value compiles a pipeline per value, so the minis kernels take the slot count
+/// from the grid instead.
+fn addGroupMembers(cfg: mlx.mlx_fast_metal_kernel_config, group: c_int) !void {
+    if (group == 0) return;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GROUP", group));
 }
 
 fn logGroupedEngaged(group: c_int) void {
@@ -2638,6 +2645,7 @@ var pair_gemv_grouped_kernel: KernelSlots = no_kernels;
 var pair_gemv_minis_kernel: KernelSlots = no_kernels;
 var down_fused_minis_kernel: KernelSlots = no_kernels;
 var down_minis_cfgs: CfgCache(DownFusedKey, 8) = .{};
+var pair_minis_cfgs: CfgCache(PairGemvKey, 8) = .{};
 var mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_shared_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -2675,10 +2683,16 @@ fn applyOuts(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []con
 
 /// `group_ask` > 0 asks for the expert-grouped kernel; only the lane funnel has one.
 fn pairGemvConfig(in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, rate: exl3.Rate, layout: GemvLayout, group: c_int) !mlx.mlx_fast_metal_kernel_config {
+    return pairGemvConfigIn(&pair_gemv_cfgs, in_dim, out_dim, nslots, topk, rate, layout, group, true);
+}
+
+/// `slots_arg`: the kernel reads NSLOTS, a template argument (the MiMo grouped kernels); else only GROUP, and the
+/// minis kernels read the slots from the grid, so one pipeline serves every pair count.
+fn pairGemvConfigIn(cache: *CfgCache(PairGemvKey, 8), in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, rate: exl3.Rate, layout: GemvLayout, group: c_int, slots_arg: bool) !mlx.mlx_fast_metal_kernel_config {
     const out_tiles = @divExact(out_dim, 16);
     const nsplit: c_int = @intCast(pairSplitCountFor(in_dim));
     const key = PairGemvKey{ .in_dim = in_dim, .out_dim = out_dim, .nslots = nslots, .nsplit = nsplit, .topk = topk, .n = rate.n, .layout = layout, .group = group };
-    if (pair_gemv_cfgs.get(key)) |c| return c;
+    if (cache.get(key)) |c| return c;
     const c = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
     const sh = [_]c_int{ nslots * nsplit, out_dim };
@@ -2692,8 +2706,8 @@ fn pairGemvConfig(in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, rat
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
     try addGemvLayout(c, layout);
-    try addGroup(c, group, nslots);
-    pair_gemv_cfgs.put(key, c);
+    if (slots_arg) try addGroup(c, group, nslots) else try addGroupMembers(c, group);
+    cache.put(key, c);
     return c;
 }
 
@@ -2733,7 +2747,7 @@ pub fn pairGemvMinis(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, s
     if (ush[ush.len - 1] != tsh[tsh.len - 1]) return error.BadExl3Shape;
     const layout = gemvLayout(rate.n, @divExact(out_dim, 16));
     if (!layout.funnel and rate.n != 64) return error.Exl3MinisRate;
-    const cfg = try pairGemvConfig(in_dim, out_dim, nslots, topk, rate, layout, DECODE_GROUP_MEMBERS);
+    const cfg = try pairGemvConfigIn(&pair_minis_cfgs, in_dim, out_dim, nslots, topk, rate, layout, DECODE_GROUP_MEMBERS, false);
     const ins = [_][*:0]const u8{ "x", "suhg", "suhu", "tg", "tu", "slots" };
     const outs = [_][*:0]const u8{ "yg", "yu" };
     const kernel = try codebookKernel(&pair_gemv_minis_kernel, "sushi_exl3_pair_gemv_minis", &ins, &outs, PAIR_GEMV_MINIS_SOURCE);
@@ -2787,7 +2801,7 @@ pub fn downGemvFusedMidMinis(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
         try addGemvLayout(c, layout);
-        try addGroup(c, DECODE_GROUP_MEMBERS, nslots);
+        try addGroupMembers(c, DECODE_GROUP_MEMBERS);
         down_minis_cfgs.put(key, c);
         break :blk c;
     };
@@ -8512,15 +8526,15 @@ const DOWN_PREPARED_GROUPED_SOURCE: [:0]const u8 =
 ++ GROUP_MEMBERS_SOURCE ++ groupBySize(downGroupedBody);
 
 /// GLM-5.3's minis (`glmMinisOn`): a pair's TOPK slots are its expert's minis (expert row x TOPK + rank) at positions
-/// pair x TOPK + rank, so a slot's equals sit at its own rank of the other pairs, and NSLOTS / TOPK pairs fit one 64-bit
-/// ballot. The slot whose index among its rank's equals is a multiple of `GROUP` leads itself and the next
+/// pair x TOPK + rank, so a slot's equals sit at its own rank of the other pairs, and the grid's slots / TOPK pairs fit
+/// one 64-bit ballot (the slot count from the grid, not a template argument: one pipeline for every pair count). The slot whose index among its rank's equals is a multiple of `GROUP` leads itself and the next
 /// `GROUP - 1` (the other threadgroups return); a SKIP_SLOT slot (0xFFFFFFFF) leads nothing and matches no mini.
 const GROUP_MINIS_SOURCE =
     \\const uint eid = uint(slots[first]);
     \\if (eid == 0xFFFFFFFFu) return;
     \\const uint rank = first % uint(TOPK);
     \\const uint fp = first / uint(TOPK);
-    \\constexpr uint NPAIRS = uint(NSLOTS) / uint(TOPK);
+    \\const uint NPAIRS = uint(threadgroups_per_grid.y) / uint(TOPK);
     \\ulong same = 0ul;
     \\for (uint b = 0u; b < NPAIRS; b += 32u) {
     \\  const bool hit = b + lane < NPAIRS && uint(slots[(b + lane) * uint(TOPK) + rank]) == eid;
