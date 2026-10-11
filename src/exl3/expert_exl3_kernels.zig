@@ -121,6 +121,9 @@ fn dumpAbsMax(s: mlx.mlx_stream, a: mlx.mlx_array, name: []const u8) !void {
 
 pub const DECODE_ROWS_MAX: usize = 16;
 
+/// A decode-chain row whose every slot is SKIP_SLOT is skipped: the chain writes nothing for it.
+pub const SKIP_SLOT: u32 = 0xFFFF_FFFF;
+
 /// The trellis rate a packed last dim carries: n halfwords per 256-weight tile,
 /// K = n/16. Every kernel keys on n, never on an integer K.
 fn packedRate(last: c_int) !exl3.Rate {
@@ -2007,6 +2010,7 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\constexpr uint SGS = 4u;
     \\constexpr uint SPLITS = 1u;
     \\const uint eid = uint(slots[slot]);
+    \\if (eid == 0xFFFFFFFFu) return;
     \\const float sc = 0.08838834764831845f;
     \\const uint nblocks = uint(IDIM) / 128u;
     \\for (uint block = sg; block < nblocks; block += SGS) {
@@ -2288,6 +2292,7 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\const uint tk0 = split * tiles_per_split;
     \\const uint tk1 = min(tk0 + tiles_per_split, IT);
     \\const uint eid = uint(slots[slot]);
+    \\if (eid == 0xFFFFFFFFu) return;
     \\constexpr uint KSPAN = uint(IDIM) / uint(NSPLIT);
     \\threadgroup half prepared[2u * KSPAN];
     \\{
@@ -2552,6 +2557,7 @@ const REDUCE_SOURCE: [:0]const u8 =
     \\const uint base = block * 128u;
     \\const uint slot = row * uint(TOPK) + sg;
     \\const uint eid = uint(slots[slot]);
+    \\if (uint(slots[row * uint(TOPK)]) == 0xFFFFFFFFu) return;
     \\const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
     \\const size_t sb = (size_t)eid * (size_t)(ODIM) + base;
     \\const float scv = 0.08838834764831845f;
@@ -4679,6 +4685,88 @@ test "exl3 fused decode chain rows match N solo calls" {
         try mlx.check(mlx.mlx_array_eval(c_s));
         const ss = mlx.mlx_array_data_float16(c_s) orelse return error.F16Unreadable;
         try expectRelRms(sf[r * dim ..][0..dim], ss[0..dim], 0.01);
+    }
+}
+
+/// The decode chain over `slots_h` (`rows` rows of `topk` slots, x `xh`) on the fixture's tile stacked `E` times, f16.
+fn decodeChainRows(alloc: std.mem.Allocator, fixture: []const u8, xh: []const u16, slots_h: []const u32, scores_h: []const f32, rows: usize, topk: usize) ![]u16 {
+    const s = mlx.gpuStream();
+    const E: usize = 4;
+    const dim: usize = 128;
+    const header_len = std.mem.readInt(u64, fixture[0..8], .little);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture[8 .. 8 + header_len], .{});
+    const data = fixture[8 + header_len ..];
+    const span = struct {
+        fn f(v: std.json.Value, name: []const u8, d: []const u8) []const u16 {
+            const o = v.object.get(name).?.object.get("data_offsets").?.array.items;
+            return @alignCast(std.mem.bytesAsSlice(u16, d[@intCast(o[0].integer)..@intCast(o[1].integer)]));
+        }
+    }.f;
+    const tb = span(parsed.value, "trellis", data);
+    const n: c_int = @intCast(tb.len / 64);
+    const st = try alloc.alloc(u16, E * tb.len);
+    const ssuh = try alloc.alloc(u16, E * dim);
+    const ssvh = try alloc.alloc(u16, E * dim);
+    for (0..E) |e| {
+        @memcpy(st[e * tb.len ..][0..tb.len], tb);
+        @memcpy(ssuh[e * dim ..][0..dim], span(parsed.value, "suh", data));
+        @memcpy(ssvh[e * dim ..][0..dim], span(parsed.value, "svh", data));
+    }
+    const x_arr = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x_arr);
+    const tr = mlx.mlx_array_new_data(st.ptr, &[_]c_int{ @intCast(E), 8, 8, n }, 4, .uint16);
+    defer _ = mlx.mlx_array_free(tr);
+    const suh = mlx.mlx_array_new_data(ssuh.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(suh);
+    const svh = mlx.mlx_array_new_data(ssvh.ptr, &[_]c_int{ @intCast(E), @intCast(dim) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    const slots = mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const scores = mlx.mlx_array_new_data(scores_h.ptr, &[_]c_int{@intCast(rows * topk)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const y = try moeSwigluFused(s, x_arr, tr, suh, svh, tr, suh, svh, tr, suh, svh, slots, scores, .float16);
+    defer _ = mlx.mlx_array_free(y);
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, y, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const got = mlx.mlx_array_data_float16(c) orelse return error.F16Unreadable;
+    const out = try alloc.alloc(u16, rows * dim);
+    for (out, got[0 .. rows * dim]) |*o, v| o.* = @bitCast(v);
+    return out;
+}
+
+test "exl3 fused decode chain: a row of SKIP_SLOT slots is skipped and every other row keeps its bits at any width" {
+    const t = std.testing;
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const rows: usize = 8;
+    const topk: usize = 4;
+    const dim: usize = 128;
+    defer setDecodeParams(.mul1);
+    for ([_]struct { fx: []const u8, dec: exl3.Decode }{ .{ .fx = exl3.fixtures.k4, .dec = .mul1 }, .{ .fx = exl3.fixtures.k3_mcg, .dec = .mcg } }) |c| {
+        setDecodeParams(c.dec);
+        var prng = std.Random.DefaultPrng.init(47);
+        const rnd = prng.random();
+        const xh = try alloc.alloc(u16, rows * dim);
+        for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+        const slots_h = try alloc.alloc(u32, rows * topk);
+        for (slots_h, 0..) |*v, i| v.* = @intCast((i * 3 + i / topk) % 4);
+        const scores_h = try alloc.alloc(f32, rows * topk);
+        @memset(scores_h, 1);
+        const all = try decodeChainRows(alloc, c.fx, xh, slots_h, scores_h, rows, topk);
+        // Rows 1, 4 and 6 skipped: the others are the full call's bits.
+        const skipped = try alloc.dupe(u32, slots_h);
+        for ([_]usize{ 1, 4, 6 }) |r| @memset(skipped[r * topk ..][0..topk], SKIP_SLOT);
+        const part = try decodeChainRows(alloc, c.fx, xh, skipped, scores_h, rows, topk);
+        for (0..rows) |r| if (r != 1 and r != 4 and r != 6) try t.expectEqualSlices(u16, all[r * dim ..][0..dim], part[r * dim ..][0..dim]);
+        // Each row alone: the same bits as in the eight-row call.
+        for (0..rows) |r| {
+            const solo = try decodeChainRows(alloc, c.fx, xh[r * dim ..][0..dim], slots_h[r * topk ..][0..topk], scores_h[0..topk], 1, topk);
+            try t.expectEqualSlices(u16, all[r * dim ..][0..dim], solo);
+        }
     }
 }
 
